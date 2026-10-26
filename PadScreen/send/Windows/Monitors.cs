@@ -10,6 +10,7 @@ sealed class MonitorInfo
     public string MonitorName = "";
     public bool Primary;
     public bool Virtual;
+    public bool Attached;
     public int X;
     public int Y;
     public int Width;
@@ -20,12 +21,14 @@ static class Monitors
 {
     private static readonly object Gate = new();
     private static readonly Dictionary<string, string> Claims = new();
+    private static long detachWindow;
+    private static int detachBurst;
 
     public static string Claim(string key, int width, int height)
     {
         lock (Gate)
         {
-            var all = List();
+            var all = List(false);
             foreach (var monitor in all)
             {
                 Log.Write($"屏幕 {monitor.DeviceName} {monitor.MonitorName} {monitor.Adapter} {monitor.Width}x{monitor.Height} virtual={monitor.Virtual} primary={monitor.Primary}");
@@ -44,7 +47,7 @@ static class Monitors
             var free = all.Where(item => item.Virtual && !item.Primary && !used.Contains(item.DeviceName)).ToList();
             if (free.Count == 0)
             {
-                throw new IOException("没有空闲的虚拟屏幕。先在菜单里点「准备虚拟屏幕」，装好驱动并让它出现在系统的显示设置里。");
+                throw new IOException("没有空闲的虚拟屏幕。先在菜单里点「准备虚拟屏幕」，装好 Virtual Display Driver。");
             }
             var chosen = free[0];
             ApplyMode(chosen.DeviceName, width, height);
@@ -58,7 +61,82 @@ static class Monitors
         lock (Gate)
         {
             Claims.Remove(key);
+            if (Claims.Count == 0)
+            {
+                DetachUnlocked();
+            }
+            else
+            {
+                ParkUnlocked();
+            }
         }
+    }
+
+    public static void DetachAll()
+    {
+        lock (Gate)
+        {
+            Claims.Clear();
+            DetachUnlocked();
+        }
+    }
+
+    public static void SyncLayout()
+    {
+        lock (Gate)
+        {
+            if (Claims.Count == 0)
+            {
+                var now = Environment.TickCount64;
+                if (now - detachWindow > 10000)
+                {
+                    detachWindow = now;
+                    detachBurst = 0;
+                }
+                detachBurst++;
+                if (detachBurst > 4)
+                {
+                    if (detachBurst == 5)
+                    {
+                        Log.Write("虚拟屏幕会反复接上，不再收起。鼠标留在主屏幕。");
+                    }
+                    ParkUnlocked();
+                    return;
+                }
+                DetachUnlocked();
+                return;
+            }
+            ParkUnlocked();
+        }
+    }
+
+    public static bool HasVirtual()
+    {
+        return List(false).Any(item => item.Virtual && !item.Primary);
+    }
+
+    public static bool PrimaryIsParallels()
+    {
+        return List(true).Any(item => item.Primary && item.Adapter.Contains("Parallels", StringComparison.OrdinalIgnoreCase));
+    }
+
+    public static bool TryLayout(out Rectangle primary, out Rectangle desktop)
+    {
+        var all = List(true).Where(item => item.Width > 0 && item.Height > 0).ToList();
+        var main = all.FirstOrDefault(item => item.Primary);
+        if (main == null || !all.Any(item => item.Virtual && !item.Primary))
+        {
+            primary = Rectangle.Empty;
+            desktop = Rectangle.Empty;
+            return false;
+        }
+        primary = new Rectangle(main.X, main.Y, main.Width, main.Height);
+        var left = all.Min(item => item.X);
+        var top = all.Min(item => item.Y);
+        var right = all.Max(item => item.X + item.Width);
+        var bottom = all.Max(item => item.Y + item.Height);
+        desktop = new Rectangle(left, top, Math.Max(1, right - left), Math.Max(1, bottom - top));
+        return true;
     }
 
     public static bool TryBounds(string deviceName, out int x, out int y, out int width, out int height)
@@ -79,7 +157,7 @@ static class Monitors
         return width > 0 && height > 0;
     }
 
-    private static List<MonitorInfo> List()
+    private static List<MonitorInfo> List(bool attachedOnly)
     {
         var result = new List<MonitorInfo>();
         for (uint index = 0; index < 16; index++)
@@ -90,7 +168,8 @@ static class Monitors
             {
                 break;
             }
-            if ((adapter.StateFlags & 1) == 0 || (adapter.StateFlags & 8) != 0)
+            var attached = (adapter.StateFlags & 1) != 0;
+            if ((attachedOnly && !attached) || (adapter.StateFlags & 8) != 0)
             {
                 continue;
             }
@@ -103,7 +182,8 @@ static class Monitors
                 Adapter = adapter.DeviceString ?? "",
                 MonitorName = hasMonitor ? monitor.DeviceString ?? "" : "",
                 Primary = (adapter.StateFlags & 4) != 0,
-                Virtual = IsVirtual(adapter, hasMonitor ? monitor : null)
+                Virtual = IsVirtual(adapter, hasMonitor ? monitor : null),
+                Attached = attached
             };
             if (TryBounds(adapter.DeviceName, out var x, out var y, out var width, out var height))
             {
@@ -126,61 +206,131 @@ static class Monitors
 
     private static void ApplyMode(string deviceName, int width, int height)
     {
-        var mode = new DevMode();
-        mode.dmDeviceName = new string('\0', 32);
-        mode.dmFormName = new string('\0', 32);
-        mode.dmSize = (short)Marshal.SizeOf<DevMode>();
-        if (!EnumDisplaySettings(deviceName, -1, ref mode))
+        if (!ReadMode(deviceName, out var mode))
         {
             throw new IOException("读不到虚拟屏幕的当前模式");
         }
+        var origin = OutsideOrigin(deviceName);
         mode.dmPelsWidth = width;
         mode.dmPelsHeight = height;
         mode.dmDisplayFrequency = 60;
-        if (Overlaps(deviceName, mode.dmPositionX, mode.dmPositionY, width, height))
-        {
-            mode.dmPositionX = RightEdge(deviceName);
-            mode.dmPositionY = 0;
-        }
+        mode.dmPositionX = origin.X;
+        mode.dmPositionY = origin.Y;
         mode.dmFields = 0x20 | 0x80000 | 0x100000 | 0x400000;
-        var changed = ChangeDisplaySettingsEx(deviceName, ref mode, IntPtr.Zero, 0x1 | 0x10000000, IntPtr.Zero);
-        var applied = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
-        if (changed != 0 || applied != 0)
+        if (!Commit(deviceName, ref mode, out var changed, out var applied))
         {
             throw new IOException($"系统没有接受 {width}×{height}。在「准备虚拟屏幕」里写入分辨率后，到设备管理器禁用再启用 Virtual Display Driver。代码 {changed}/{applied}");
         }
+        Log.Write($"虚拟屏幕 {deviceName} 接到主屏幕右侧 {origin.X},{origin.Y} {width}x{height}");
+        ParkUnlocked();
     }
 
-    private static bool Overlaps(string deviceName, int x, int y, int width, int height)
+    private static void ParkUnlocked()
     {
-        var mine = new Rectangle(x, y, width, height);
-        foreach (var monitor in List())
+        var all = List(true);
+        var primary = all.FirstOrDefault(item => item.Primary && item.Width > 0);
+        if (primary == null)
         {
-            if (monitor.DeviceName == deviceName || monitor.Width <= 0 || monitor.Height <= 0)
+            return;
+        }
+        var x = primary.X + primary.Width;
+        foreach (var monitor in all.Where(item => item.Virtual && !item.Primary && item.Width > 0).OrderBy(item => item.DeviceName))
+        {
+            if (monitor.X == x && monitor.Y == primary.Y)
+            {
+                x += monitor.Width;
+                continue;
+            }
+            if (!ReadMode(monitor.DeviceName, out var mode))
             {
                 continue;
             }
-            var other = new Rectangle(monitor.X, monitor.Y, monitor.Width, monitor.Height);
-            if (mine.IntersectsWith(other))
+            mode.dmPositionX = x;
+            mode.dmPositionY = primary.Y;
+            mode.dmFields = 0x20 | 0x80000 | 0x100000 | 0x400000;
+            if (Commit(monitor.DeviceName, ref mode, out var changed, out var applied))
             {
-                return true;
+                Log.Write($"虚拟屏幕 {monitor.DeviceName} 移到 {x},{primary.Y}");
             }
+            else
+            {
+                Log.Write($"虚拟屏幕 {monitor.DeviceName} 没能移到主屏幕右侧。代码 {changed}/{applied}");
+            }
+            x += monitor.Width;
         }
-        return false;
     }
 
-    private static int RightEdge(string except)
+    private static void DetachUnlocked()
     {
-        var edge = 0;
-        foreach (var monitor in List())
+        foreach (var monitor in List(true))
         {
-            if (monitor.DeviceName == except)
+            if (!monitor.Virtual || monitor.Primary || Claims.ContainsValue(monitor.DeviceName))
             {
                 continue;
             }
-            edge = Math.Max(edge, monitor.X + monitor.Width);
+            if (!ReadMode(monitor.DeviceName, out var mode))
+            {
+                continue;
+            }
+            mode.dmPelsWidth = 0;
+            mode.dmPelsHeight = 0;
+            mode.dmPositionX = 0;
+            mode.dmPositionY = 0;
+            mode.dmFields = 0x20 | 0x80000 | 0x100000;
+            if (Commit(monitor.DeviceName, ref mode, out var changed, out var applied))
+            {
+                Log.Write("已收起虚拟屏幕 " + monitor.DeviceName);
+            }
+            else
+            {
+                Log.Write($"没能收起虚拟屏幕 {monitor.DeviceName}。代码 {changed}/{applied}");
+            }
         }
-        return edge;
+    }
+
+    private static Point OutsideOrigin(string deviceName)
+    {
+        var all = List(true);
+        var primary = all.FirstOrDefault(item => item.Primary && item.Width > 0);
+        var x = primary == null ? 0 : primary.X + primary.Width;
+        var y = primary?.Y ?? 0;
+        foreach (var monitor in all.Where(item => item.Virtual && !item.Primary && item.Width > 0 && item.DeviceName != deviceName).OrderBy(item => item.DeviceName))
+        {
+            if (string.Compare(monitor.DeviceName, deviceName, StringComparison.Ordinal) < 0)
+            {
+                x += monitor.Width;
+            }
+        }
+        return new Point(x, y);
+    }
+
+    private static bool ReadMode(string deviceName, out DevMode mode)
+    {
+        mode = new DevMode();
+        mode.dmDeviceName = new string('\0', 32);
+        mode.dmFormName = new string('\0', 32);
+        mode.dmSize = (short)Marshal.SizeOf<DevMode>();
+        if (EnumDisplaySettings(deviceName, -1, ref mode))
+        {
+            return true;
+        }
+        mode.dmDeviceName = new string('\0', 32);
+        mode.dmFormName = new string('\0', 32);
+        mode.dmSize = (short)Marshal.SizeOf<DevMode>();
+        return EnumDisplaySettings(deviceName, -2, ref mode);
+    }
+
+    private static bool Commit(string deviceName, ref DevMode mode, out int changed, out int applied)
+    {
+        changed = ChangeDisplaySettingsEx(deviceName, ref mode, IntPtr.Zero, 0x1 | 0x10000000, IntPtr.Zero);
+        applied = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+        if (changed == 0 && applied == 0)
+        {
+            return true;
+        }
+        changed = ChangeDisplaySettingsEx(deviceName, ref mode, IntPtr.Zero, 0x1 | 0x40000000, IntPtr.Zero);
+        applied = 0;
+        return changed == 0;
     }
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]

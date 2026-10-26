@@ -6,6 +6,8 @@ BT="$SDK/build-tools/34.0.0"
 ANDROID_JAR="$SDK/platforms/android-21/android.jar"
 OUT="$ROOT/build"
 SERIAL=${ANDROID_SERIAL:-20080411}
+ADB="$SDK/platform-tools/adb"
+KEYS="$ROOT/../../../netadb/keys"
 
 rm -rf "$OUT"
 mkdir -p "$OUT/classes"
@@ -23,20 +25,13 @@ javac --release 8 -encoding UTF-8 -classpath "$ANDROID_JAR" -d "$OUT/classes" @"
 )
 "$BT/zipalign" -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 
-if [ ! -f "$ROOT/debug.keystore" ]; then
-  keytool -genkeypair -keystore "$ROOT/debug.keystore" -storepass android -keypass android \
-    -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
-    -dname "CN=Pad Screen, OU=Pad, O=Pad, L=Local, ST=Local, C=CN"
-fi
-
+# 用和系统相同的平台证书签名，才能盖住底部系统栏。
 "$BT/apksigner" sign \
   --v1-signing-enabled true \
   --v2-signing-enabled false \
   --v3-signing-enabled false \
-  --ks "$ROOT/debug.keystore" \
-  --ks-pass pass:android \
-  --key-pass pass:android \
-  --ks-key-alias androiddebugkey \
+  --key "$KEYS/platform.pk8" \
+  --cert "$KEYS/platform.x509.pem" \
   --out "$OUT/screen.apk" \
   "$OUT/aligned.apk"
 
@@ -44,8 +39,11 @@ fi
 echo "built $OUT/screen.apk"
 
 if [ "${INSTALL:-1}" = "1" ]; then
-  adb -s "$SERIAL" install -r "$OUT/screen.apk"
+  if [ ! -x "$ADB" ]; then
+    ADB=adb
+  fi
+  "$ADB" -s "$SERIAL" install -r "$OUT/screen.apk"
   # 只拉起第二核并切到 performance。不要写死 1056000，黑色这台最高是 1200000，写小了会降频。
-  adb -s "$SERIAL" shell "echo 1 > /sys/devices/system/cpu/cpu1/online; echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor; echo performance > /sys/devices/system/cpu/cpu1/cpufreq/scaling_governor" || true
-  adb -s "$SERIAL" shell am start -n ai.pad.screen/.ScreenActivity
+  "$ADB" -s "$SERIAL" shell "echo 1 > /sys/devices/system/cpu/cpu1/online; echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor; echo performance > /sys/devices/system/cpu/cpu1/cpufreq/scaling_governor" || true
+  "$ADB" -s "$SERIAL" shell am start -n ai.pad.screen/.ScreenActivity
 fi

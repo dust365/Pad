@@ -29,6 +29,7 @@ sealed class Finder : IDisposable
     private readonly object gate = new();
     private readonly Dictionary<string, ServiceRecord> records = new();
     private Socket? socket;
+    private Socket? multicast;
     private CancellationTokenSource? cancel;
     private Thread? thread;
     private int generation;
@@ -81,7 +82,15 @@ sealed class Finder : IDisposable
         catch (Exception)
         {
         }
+        try
+        {
+            multicast?.Dispose();
+        }
+        catch (Exception)
+        {
+        }
         socket = null;
+        multicast = null;
     }
 
     private void EnsureSocket()
@@ -90,32 +99,24 @@ sealed class Finder : IDisposable
         {
             return;
         }
-        var created = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        created.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        // 查询从临时端口发出，并要求单播应答。Windows 的系统服务已经占着 5353，
+        // 发到这个端口的单播回复不会进到本程序。
+        var created = OpenUdp(0);
+        created.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastTimeToLive, 255);
+        socket = created;
+        var local = (IPEndPoint)created.LocalEndPoint!;
+        Log.Write("mDNS 查询端口 " + local.Port);
         try
         {
-            created.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null);
-        }
-        catch (Exception)
-        {
-        }
-        try
-        {
-            created.Bind(new IPEndPoint(IPAddress.Any, 5353));
-            created.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, new MulticastOption(IPAddress.Parse("224.0.0.251")));
-            SocketNote = null;
+            var group = OpenUdp(5353);
+            group.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, new MulticastOption(IPAddress.Parse("224.0.0.251")));
+            multicast = group;
         }
         catch (Exception ex)
         {
-            created.Dispose();
-            created = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            created.Bind(new IPEndPoint(IPAddress.Any, 0));
             SocketNote = "5353 端口被占用，只接收单播应答：" + ex.Message;
             Log.Write(SocketNote);
         }
-        created.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastTimeToLive, 255);
-        created.ReceiveTimeout = 1000;
-        socket = created;
         cancel = new CancellationTokenSource();
         thread = new Thread(ReceiveLoop) { IsBackground = true, Name = "pad-mdns" };
         thread.Start();
@@ -149,26 +150,56 @@ sealed class Finder : IDisposable
                 SendQuery();
                 lastQuery = DateTime.UtcNow;
             }
-            try
-            {
-                EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
-                var count = socket.ReceiveFrom(buffer, ref remote);
-                if (count > 0)
-                {
-                    Accept(buffer, count);
-                }
-            }
-            catch (SocketException)
-            {
-            }
-            catch (ObjectDisposedException)
+            Pump(socket, buffer);
+            Pump(multicast, buffer);
+        }
+    }
+
+    private static Socket OpenUdp(int port)
+    {
+        var created = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        created.ExclusiveAddressUse = false;
+        created.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        try
+        {
+            created.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null);
+        }
+        catch (Exception)
+        {
+        }
+        created.Bind(new IPEndPoint(IPAddress.Any, port));
+        created.ReceiveTimeout = 200;
+        return created;
+    }
+
+    private void Pump(Socket? current, byte[] buffer)
+    {
+        if (current == null)
+        {
+            return;
+        }
+        try
+        {
+            if (!current.Poll(200000, SelectMode.SelectRead) || current.Available <= 0)
             {
                 return;
             }
-            catch (Exception ex)
+            EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+            var count = current.ReceiveFrom(buffer, ref remote);
+            if (count > 0)
             {
-                Log.Write("mDNS 读取失败：" + ex.Message);
+                Accept(buffer, count);
             }
+        }
+        catch (SocketException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Log.Write("mDNS 读取失败：" + ex.Message);
         }
     }
 
@@ -187,17 +218,19 @@ sealed class Finder : IDisposable
                 {
                     existing = new ServiceRecord { Instance = record.Instance };
                     records[record.Instance] = existing;
+                    changed = true;
                 }
-                if (record.Port > 0)
+                if (record.Port > 0 && existing.Port != record.Port)
                 {
                     existing.Port = record.Port;
+                    changed = true;
                 }
-                if (!string.IsNullOrEmpty(record.Host))
+                if (!string.IsNullOrEmpty(record.Host) && existing.Host != record.Host)
                 {
                     existing.Host = record.Host;
+                    changed = true;
                 }
                 existing.Seen = DateTime.UtcNow;
-                changed = true;
             }
             var cutoff = DateTime.UtcNow.AddSeconds(-40);
             var stale = records.Where(pair => pair.Value.Seen < cutoff).Select(pair => pair.Key).ToList();
@@ -213,6 +246,10 @@ sealed class Finder : IDisposable
                     .Select(item => new FoundPad(item.Instance, item.Host, item.Port))
                     .OrderBy(item => item.Name, StringComparer.CurrentCulture)
                     .ToList();
+                foreach (var pad in Pads)
+                {
+                    Log.Write($"发现 {pad.Name} {pad.Host}:{pad.Port}");
+                }
                 if (Pads.Count > 0)
                 {
                     Scanning = false;
@@ -247,7 +284,6 @@ sealed class Finder : IDisposable
             {
             }
         }
-        handler();
     }
 
     private sealed class ServiceRecord
@@ -269,6 +305,7 @@ sealed class ParsedRecord
 static class DnsPacket
 {
     private const string Service = "_padscreen._tcp.local";
+    private static long lastParseLog;
 
     public static byte[] Query(string service)
     {
@@ -303,6 +340,8 @@ static class DnsPacket
         var authorities = (buffer[8] << 8) | buffer[9];
         var additional = (buffer[10] << 8) | buffer[11];
         var cursor = new Cursor(buffer, count, 12);
+        var byTarget = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var pending = new List<(string Instance, string Target, int Port)>();
         try
         {
             for (var i = 0; i < questions; i++)
@@ -312,8 +351,6 @@ static class DnsPacket
                 cursor.Read16();
             }
             var total = answers + authorities + additional;
-            var byTarget = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            var pending = new List<(string Instance, string Target, int Port)>();
             for (var i = 0; i < total; i++)
             {
                 var owner = cursor.ReadName();
@@ -325,9 +362,10 @@ static class DnsPacket
                 if (type == 12)
                 {
                     var target = cursor.ReadName();
-                    if (owner.EndsWith(Service, StringComparison.OrdinalIgnoreCase) || owner.Contains("_padscreen", StringComparison.OrdinalIgnoreCase))
+                    var instance = InstanceName(target);
+                    if (IsPadService(owner) && instance.Length > 0)
                     {
-                        records.Add(new ParsedRecord { Instance = InstanceName(target) });
+                        records.Add(new ParsedRecord { Instance = instance });
                     }
                 }
                 else if (type == 33)
@@ -336,7 +374,11 @@ static class DnsPacket
                     cursor.Read16();
                     var port = cursor.Read16();
                     var target = cursor.ReadName();
-                    pending.Add((InstanceName(owner), target, port));
+                    var instance = InstanceName(owner);
+                    if (instance.Length > 0 && port > 0)
+                    {
+                        pending.Add((instance, target, port));
+                    }
                 }
                 else if (type == 1 && length == 4)
                 {
@@ -354,54 +396,55 @@ static class DnsPacket
                     cursor.Position = start + length;
                 }
             }
-            foreach (var item in pending)
-            {
-                var host = "";
-                if (!byTarget.TryGetValue(item.Target, out host))
-                {
-                    byTarget.TryGetValue(item.Target.TrimEnd('.'), out host!);
-                }
-                var existing = records.FirstOrDefault(record => record.Instance.Equals(item.Instance, StringComparison.OrdinalIgnoreCase));
-                if (existing == null)
-                {
-                    existing = new ParsedRecord { Instance = item.Instance };
-                    records.Add(existing);
-                }
-                existing.Port = item.Port;
-                if (!string.IsNullOrEmpty(host))
-                {
-                    existing.Host = host;
-                }
-            }
-            foreach (var record in records.ToList())
-            {
-                if (string.IsNullOrEmpty(record.Host))
-                {
-                    foreach (var pair in byTarget)
-                    {
-                        if (pair.Key.StartsWith(record.Instance, StringComparison.OrdinalIgnoreCase))
-                        {
-                            record.Host = pair.Value;
-                            break;
-                        }
-                    }
-                }
-            }
-            records = records.Where(record => record.Instance.Length > 0).ToList();
-            return records.Count > 0;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            return false;
+            var now = Environment.TickCount64;
+            if (now - lastParseLog > 30000)
+            {
+                lastParseLog = now;
+                Log.Write("mDNS 解析中断：" + ex.Message);
+            }
         }
+        foreach (var item in pending)
+        {
+            var host = "";
+            if (!byTarget.TryGetValue(item.Target, out host))
+            {
+                byTarget.TryGetValue(item.Target.TrimEnd('.'), out host!);
+            }
+            var existing = records.FirstOrDefault(record => record.Instance.Equals(item.Instance, StringComparison.OrdinalIgnoreCase));
+            if (existing == null)
+            {
+                existing = new ParsedRecord { Instance = item.Instance };
+                records.Add(existing);
+            }
+            existing.Port = item.Port;
+            if (!string.IsNullOrEmpty(host))
+            {
+                existing.Host = host;
+            }
+        }
+        records = records.Where(record => record.Instance.Length > 0 && record.Port > 0 && !string.IsNullOrEmpty(record.Host)).ToList();
+        return records.Count > 0;
+    }
+
+    private static bool IsPadService(string name)
+    {
+        return name.EndsWith(Service, StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith("._padscreen._tcp.local", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("._padscreen._tcp.", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string InstanceName(string owner)
     {
         var marker = "._padscreen._tcp";
         var index = owner.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-        var name = index > 0 ? owner.Substring(0, index) : owner.TrimEnd('.');
-        return name;
+        if (index <= 0)
+        {
+            return "";
+        }
+        return owner.Substring(0, index);
     }
 
     private static byte[] EncodeName(string name)
@@ -433,6 +476,10 @@ static class DnsPacket
 
         public int Read16()
         {
+            if (Position < 0 || Position + 2 > count)
+            {
+                throw new InvalidDataException("mDNS 包不完整");
+            }
             var value = (buffer[Position] << 8) | buffer[Position + 1];
             Position += 2;
             return value;
@@ -440,6 +487,10 @@ static class DnsPacket
 
         public int Read32()
         {
+            if (Position < 0 || Position + 4 > count)
+            {
+                throw new InvalidDataException("mDNS 包不完整");
+            }
             var value = (buffer[Position] << 24) | (buffer[Position + 1] << 16) | (buffer[Position + 2] << 8) | buffer[Position + 3];
             Position += 4;
             return value;
@@ -465,7 +516,15 @@ static class DnsPacket
                 }
                 if ((length & 0xc0) == 0xc0)
                 {
+                    if (position + 1 >= count)
+                    {
+                        throw new InvalidDataException("mDNS 名称不完整");
+                    }
                     var pointer = ((length & 0x3f) << 8) | buffer[position + 1];
+                    if (pointer < 0 || pointer >= count)
+                    {
+                        throw new InvalidDataException("mDNS 名称越界");
+                    }
                     if (!returned)
                     {
                         Position = position + 2;
@@ -474,6 +533,10 @@ static class DnsPacket
                     position = pointer;
                     hops++;
                     continue;
+                }
+                if (length > 63 || position + 1 + length > count)
+                {
+                    throw new InvalidDataException("mDNS 名称不完整");
                 }
                 position++;
                 labels.Add(Encoding.ASCII.GetString(buffer, position, length));

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Xml.Linq;
 
 namespace PadScreen;
@@ -12,12 +13,42 @@ static class VirtualDisplaySetup
     {
         Directory.CreateDirectory(DirectoryPath);
         WriteSettings();
+        if (Monitors.HasVirtual())
+        {
+            Monitors.SyncLayout();
+            var ready = "驱动已经就绪。没连平板时桌面不扩展；连上后，虚拟屏幕才接到主屏幕右侧。";
+            Log.Write(ready);
+            return ready;
+        }
+        var inf = FindDriverInf();
+        var script = Path.Combine(AppContext.BaseDirectory, "install-vdd.ps1");
+        if (inf != null && File.Exists(script))
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = "-NoExit -NoProfile -ExecutionPolicy Bypass -File \"" + script + "\" \"" + inf + "\"",
+                    UseShellExecute = true,
+                    Verb = "runas"
+                });
+                var started = "分辨率已经写入。请在弹出的窗口里允许安装虚拟显示驱动，装完后再点平板。";
+                Log.Write(started);
+                return started;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("安装驱动失败：" + ex.Message);
+                return "分辨率已经写入。安装虚拟显示驱动没有开始：" + ex.Message;
+            }
+        }
         try
         {
             Process.Start(new ProcessStartInfo
             {
-                FileName = "winget",
-                Arguments = "install --id=VirtualDrivers.Virtual-Display-Driver -e --accept-package-agreements --accept-source-agreements",
+                FileName = "cmd.exe",
+                Arguments = "/k winget install --id=VirtualDrivers.Virtual-Display-Driver -e --accept-package-agreements --accept-source-agreements",
                 UseShellExecute = true
             });
         }
@@ -26,7 +57,29 @@ static class VirtualDisplaySetup
             Log.Write("启动 winget 失败：" + ex.Message);
             return "分辨率已经写入 " + SettingsPath + "。本机没有 winget，请到 Virtual Display Driver 的发布页安装驱动，然后在设备管理器里禁用再启用它。";
         }
-        return "已写入 1024×600 和 800×480，并开始安装虚拟显示驱动。装完后在设备管理器里禁用再启用 Virtual Display Driver，然后重新扫描。";
+        var winget = "分辨率已经写入，并打开了安装窗口。装完后在设备管理器里禁用再启用 Virtual Display Driver，然后点平板。";
+        Log.Write(winget);
+        return winget;
+    }
+
+    private static string? FindDriverInf()
+    {
+        var packages = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "WinGet", "Packages");
+        if (!Directory.Exists(packages))
+        {
+            return null;
+        }
+        string[] found;
+        try
+        {
+            found = Directory.GetFiles(packages, "MttVDD.inf", SearchOption.AllDirectories);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+        var arm = RuntimeInformation.ProcessArchitecture == Architecture.Arm64;
+        return found.FirstOrDefault(path => path.Contains("ARM64", StringComparison.OrdinalIgnoreCase) == arm);
     }
 
     private static void WriteSettings()
@@ -83,8 +136,32 @@ static class VirtualDisplaySetup
         }
         EnsureResolution(resolutions, 1024, 600);
         EnsureResolution(resolutions, 800, 480);
+        EnsureSection(root, "logging",
+            new XElement("SendLogsThroughPipe", false),
+            new XElement("logging", false),
+            new XElement("debuglogging", false));
+        EnsureSection(root, "colour",
+            new XElement("SDR10bit", false),
+            new XElement("HDRPlus", false),
+            new XElement("ColourFormat", "RGB"));
+        EnsureSection(root, "cursor",
+            new XElement("HardwareCursor", true),
+            new XElement("AlphaCursorSupport", true));
+        EnsureSection(root, "edid",
+            new XElement("CustomEdid", false),
+            new XElement("PreventSpoof", false),
+            new XElement("EdidCeaOverride", false));
         document.Save(SettingsPath);
         Log.Write("已写入 " + SettingsPath);
+    }
+
+    private static void EnsureSection(XElement root, string name, params XElement[] children)
+    {
+        if (root.Element(name) != null)
+        {
+            return;
+        }
+        root.Add(new XElement(name, children));
     }
 
     private static void EnsureResolution(XElement resolutions, int width, int height)

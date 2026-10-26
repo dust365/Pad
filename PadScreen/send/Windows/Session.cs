@@ -17,10 +17,24 @@ sealed class Session
     private int padWidth = 1024;
     private int padHeight = 600;
     private bool buttonDown;
+    private int missedBounds;
+    private int injectFailures;
+    private Bitmap? scratch;
+    private byte[]? opaque;
+    private readonly object pointer = new();
     private byte[] previous = Array.Empty<byte>();
     private int previousStride;
     private DateTime lastKeyframe = DateTime.MinValue;
     private bool sending;
+    private bool cursorLogged;
+    private long captureLogAt;
+
+    private const int MouseMove = 0x0001;
+    private const int MouseLeftDown = 0x0002;
+    private const int MouseLeftUp = 0x0004;
+    private const int MouseAbsolute = 0x8000;
+    private const int MouseVirtualDesk = 0x4000;
+    private const int MousePlace = MouseMove | MouseAbsolute | MouseVirtualDesk;
 
     public Session(FoundPad pad, Action refresh)
     {
@@ -44,6 +58,7 @@ sealed class Session
     {
         stopped = true;
         Live = false;
+        ReleaseButton();
         try
         {
             link?.Dispose();
@@ -81,6 +96,7 @@ sealed class Session
             deviceName = Monitors.Claim(Key, padWidth, padHeight);
             Live = true;
             refresh();
+            TrayApp.Notify("已连接 " + Name);
             capture = new Thread(CaptureLoop) { IsBackground = true, Name = "pad-capture-" + pad.Host };
             capture.Start();
             while (!stopped)
@@ -109,75 +125,130 @@ sealed class Session
     private void CaptureLoop()
     {
         using var bitmap = new Bitmap(padWidth, padHeight, PixelFormat.Format32bppArgb);
-        while (!stopped)
+        try
         {
-            var started = Environment.TickCount64;
-            var grabbed = false;
-            try
+            while (!stopped)
             {
-                grabbed = !sending && Grab(bitmap);
-            }
-            catch (Exception ex)
-            {
-                Log.Write("采集失败：" + ex.Message);
-            }
-            if (grabbed)
-            {
+                var started = Environment.TickCount64;
+                var grabbed = false;
+                var missed = false;
+                var busy = sending;
                 try
                 {
-                    var frames = MakeFrames(bitmap);
-                    if (frames.Count > 0)
+                    if (!busy)
                     {
-                        sending = true;
-                        try
-                        {
-                            var current = link;
-                            if (current != null && !stopped)
-                            {
-                                foreach (var frame in frames)
-                                {
-                                    current.WriteFrame(frame.Type, frame.Payload);
-                                }
-                            }
-                        }
-                        finally
-                        {
-                            sending = false;
-                        }
+                        grabbed = Grab(bitmap);
+                        missed = !grabbed;
                     }
                 }
                 catch (Exception ex)
                 {
-                    if (!stopped)
+                    var now = Environment.TickCount64;
+                    if (now - captureLogAt > 2000)
                     {
-                        TrayApp.OnSessionFailed(this, ex.Message);
+                        captureLogAt = now;
+                        Log.Write("采集失败：" + ex.Message);
+                    }
+                }
+                if (missed)
+                {
+                    missedBounds++;
+                    if (missedBounds >= 30)
+                    {
+                        TrayApp.OnSessionFailed(this, "虚拟屏幕不见了");
                         return;
                     }
                 }
+                else if (grabbed)
+                {
+                    missedBounds = 0;
+                }
+                if (grabbed)
+                {
+                    try
+                    {
+                        var frames = MakeFrames(bitmap);
+                        if (frames.Count > 0)
+                        {
+                            sending = true;
+                            try
+                            {
+                                var current = link;
+                                if (current != null && !stopped)
+                                {
+                                    foreach (var frame in frames)
+                                    {
+                                        current.WriteFrame(frame.Type, frame.Payload);
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                sending = false;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!stopped)
+                        {
+                            TrayApp.OnSessionFailed(this, ex.Message);
+                            return;
+                        }
+                    }
+                }
+                var spent = Environment.TickCount64 - started;
+                if (spent < 66)
+                {
+                    Thread.Sleep((int)(66 - spent));
+                }
             }
-            var spent = Environment.TickCount64 - started;
-            if (spent < 66)
-            {
-                Thread.Sleep((int)(66 - spent));
-            }
+        }
+        finally
+        {
+            scratch?.Dispose();
+            scratch = null;
         }
     }
 
     private bool Grab(Bitmap target)
     {
-        if (!Monitors.TryBounds(deviceName, out var x, out var y, out var width, out var height))
+        if (!Monitors.TryBounds(deviceName, out var originX, out var originY, out var width, out var height))
         {
             return false;
         }
-        using var raw = new Bitmap(width, height, PixelFormat.Format32bppArgb);
-        using (var graphics = Graphics.FromImage(raw))
+        var direct = width == target.Width && height == target.Height;
+        var surface = direct ? target : Scratch(width, height);
+        using (var graphics = Graphics.FromImage(surface))
         {
-            graphics.CopyFromScreen(x, y, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
+            graphics.CopyFromScreen(originX, originY, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
         }
-        using var canvas = Graphics.FromImage(target);
-        canvas.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        canvas.DrawImage(raw, new Rectangle(0, 0, padWidth, padHeight));
+        // CopyFromScreen 留下的 alpha 是 0。先补成不透明，光标才不会画到一块全透明的图上。
+        ForceOpaque(surface);
+        using (var graphics = Graphics.FromImage(surface))
+        {
+            DrawCursor(graphics, originX, originY, width, height);
+        }
+        ForceOpaque(surface);
+        if (!direct)
+        {
+            using var canvas = Graphics.FromImage(target);
+            canvas.CompositingMode = CompositingMode.SourceCopy;
+            canvas.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            canvas.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            canvas.DrawImage(surface, new Rectangle(0, 0, target.Width, target.Height));
+        }
         return true;
+    }
+
+    private Bitmap Scratch(int width, int height)
+    {
+        if (scratch == null || scratch.Width != width || scratch.Height != height)
+        {
+            scratch?.Dispose();
+            scratch = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        }
+        return scratch;
     }
 
     private List<(int Type, byte[] Payload)> MakeFrames(Bitmap bitmap)
@@ -362,48 +433,260 @@ sealed class Session
 
     private void PostTouch(int action, int x, int y)
     {
-        if (!Monitors.TryBounds(deviceName, out var left, out var top, out var width, out var height))
+        if (stopped || Marshal.SizeOf<Input>() != 40)
+        {
+            if (Marshal.SizeOf<Input>() != 40 && injectFailures == 0)
+            {
+                injectFailures++;
+                Log.Write("鼠标注入只支持 64 位进程");
+            }
+            return;
+        }
+        if (!TryAbsolute(x, y, out var absoluteX, out var absoluteY))
         {
             return;
         }
-        var screenX = left + x * width / padWidth;
-        var screenY = top + y * height / padHeight;
+        // 按下和抬起必须先移动。否则 Windows 在当前光标处点击，不看绝对坐标。
+        lock (pointer)
+        {
+            if (stopped)
+            {
+                return;
+            }
+            Input[] inputs;
+            if (action == Wire.TouchDown)
+            {
+                inputs = new[]
+                {
+                    Pointer(absoluteX, absoluteY, MousePlace),
+                    Pointer(absoluteX, absoluteY, MousePlace | MouseLeftDown)
+                };
+                buttonDown = true;
+            }
+            else if (action == Wire.TouchUp)
+            {
+                inputs = buttonDown
+                    ? new[]
+                    {
+                        Pointer(absoluteX, absoluteY, MousePlace),
+                        Pointer(absoluteX, absoluteY, MousePlace | MouseLeftUp)
+                    }
+                    : new[] { Pointer(absoluteX, absoluteY, MousePlace) };
+                buttonDown = false;
+            }
+            else
+            {
+                inputs = new[] { Pointer(absoluteX, absoluteY, MousePlace) };
+            }
+            var sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>());
+            if (sent != inputs.Length && injectFailures < 5)
+            {
+                injectFailures++;
+                Log.Write("鼠标注入失败，已注入 " + sent + "/" + inputs.Length);
+            }
+        }
+    }
+
+    private void ReleaseButton()
+    {
+        lock (pointer)
+        {
+            if (!buttonDown)
+            {
+                return;
+            }
+            buttonDown = false;
+            var input = new Input { Type = 0, Flags = MouseLeftUp, Extra = PointerGuard.Mark };
+            var sent = SendInput(1, new[] { input }, Marshal.SizeOf<Input>());
+            if (sent != 1)
+            {
+                Log.Write("松开鼠标失败");
+            }
+        }
+    }
+
+    private bool TryAbsolute(int x, int y, out int absoluteX, out int absoluteY)
+    {
+        absoluteX = 0;
+        absoluteY = 0;
+        if (padWidth < 2 || padHeight < 2)
+        {
+            return false;
+        }
+        if (!Monitors.TryBounds(deviceName, out var left, out var top, out var width, out var height))
+        {
+            return false;
+        }
+        if (x < 0)
+        {
+            x = 0;
+        }
+        if (y < 0)
+        {
+            y = 0;
+        }
+        var localX = (int)((long)x * width / padWidth);
+        var localY = (int)((long)y * height / padHeight);
+        if (localX >= width)
+        {
+            localX = width - 1;
+        }
+        if (localY >= height)
+        {
+            localY = height - 1;
+        }
+        var screenX = left + localX;
+        var screenY = top + localY;
         var virtualLeft = GetSystemMetrics(76);
         var virtualTop = GetSystemMetrics(77);
-        var virtualWidth = Math.Max(1, GetSystemMetrics(78));
-        var virtualHeight = Math.Max(1, GetSystemMetrics(79));
-        var absoluteX = (int)((screenX - virtualLeft) * 65535L / (virtualWidth - 1));
-        var absoluteY = (int)((screenY - virtualTop) * 65535L / (virtualHeight - 1));
-        var flags = 0x8000 | 0x4000;
-        if (action == Wire.TouchDown)
+        var spanX = Math.Max(1, GetSystemMetrics(78) - 1);
+        var spanY = Math.Max(1, GetSystemMetrics(79) - 1);
+        absoluteX = (int)((screenX - virtualLeft) * 65535L / spanX);
+        absoluteY = (int)((screenY - virtualTop) * 65535L / spanY);
+        if (absoluteX < 0)
         {
-            flags |= 0x0002;
-            buttonDown = true;
+            absoluteX = 0;
         }
-        else if (action == Wire.TouchUp)
+        else if (absoluteX > 65535)
         {
-            flags |= 0x0004;
-            buttonDown = false;
+            absoluteX = 65535;
         }
-        else
+        if (absoluteY < 0)
         {
-            flags |= 0x0001;
+            absoluteY = 0;
         }
-        var input = new Input
+        else if (absoluteY > 65535)
+        {
+            absoluteY = 65535;
+        }
+        return true;
+    }
+
+    private static Input Pointer(int absoluteX, int absoluteY, int flags)
+    {
+        return new Input
         {
             Type = 0,
             X = absoluteX,
             Y = absoluteY,
-            Flags = flags
+            Flags = flags,
+            Extra = PointerGuard.Mark
         };
-        SendInput(1, new[] { input }, Marshal.SizeOf<Input>());
+    }
+
+    private void ForceOpaque(Bitmap bitmap)
+    {
+        var data = bitmap.LockBits(new Rectangle(0, 0, bitmap.Width, bitmap.Height), ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        try
+        {
+            var length = data.Stride * bitmap.Height;
+            if (length <= 0)
+            {
+                return;
+            }
+            if (opaque == null || opaque.Length < length)
+            {
+                opaque = new byte[length];
+            }
+            Marshal.Copy(data.Scan0, opaque, 0, length);
+            for (var row = 0; row < bitmap.Height; row++)
+            {
+                var start = row * data.Stride;
+                var end = start + bitmap.Width * 4;
+                for (var i = start + 3; i < end; i += 4)
+                {
+                    opaque[i] = 255;
+                }
+            }
+            Marshal.Copy(opaque, 0, data.Scan0, length);
+        }
+        finally
+        {
+            bitmap.UnlockBits(data);
+        }
+    }
+
+    private void DrawCursor(Graphics graphics, int originX, int originY, int width, int height)
+    {
+        try
+        {
+            if (Marshal.SizeOf<CursorInfo>() != 24 || Marshal.SizeOf<IconInfo>() != 32)
+            {
+                NoteCursor("光标结构尺寸不对");
+                return;
+            }
+            var info = new CursorInfo { Size = Marshal.SizeOf<CursorInfo>() };
+            if (!GetCursorInfo(ref info) || (info.Flags & 1) == 0 || info.Cursor == IntPtr.Zero)
+            {
+                return;
+            }
+            if (info.X < originX || info.Y < originY || info.X >= originX + width || info.Y >= originY + height)
+            {
+                return;
+            }
+            if (!GetIconInfo(info.Cursor, out var icon))
+            {
+                return;
+            }
+            try
+            {
+                var drawX = info.X - originX - icon.HotspotX;
+                var drawY = info.Y - originY - icon.HotspotY;
+                var hdc = graphics.GetHdc();
+                try
+                {
+                    DrawIconEx(hdc, drawX, drawY, info.Cursor, 0, 0, 0, IntPtr.Zero, 3);
+                }
+                finally
+                {
+                    graphics.ReleaseHdc(hdc);
+                }
+            }
+            finally
+            {
+                if (icon.Mask != IntPtr.Zero)
+                {
+                    DeleteObject(icon.Mask);
+                }
+                if (icon.Color != IntPtr.Zero)
+                {
+                    DeleteObject(icon.Color);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            NoteCursor(ex.Message);
+        }
+    }
+
+    private void NoteCursor(string message)
+    {
+        if (cursorLogged)
+        {
+            return;
+        }
+        cursorLogged = true;
+        Log.Write("光标没画上：" + message);
     }
 
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int index);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint count, Input[] inputs, int size);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorInfo(ref CursorInfo info);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetIconInfo(IntPtr cursor, out IconInfo icon);
+
+    [DllImport("user32.dll")]
+    private static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr icon, int width, int height, uint step, IntPtr brush, uint flags);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr handle);
 
     [StructLayout(LayoutKind.Explicit, Size = 40)]
     private struct Input
@@ -418,4 +701,24 @@ sealed class Session
     }
 
     private readonly record struct Patch(int X, int Y, int W, int H);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CursorInfo
+    {
+        public int Size;
+        public int Flags;
+        public IntPtr Cursor;
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IconInfo
+    {
+        public int Icon;
+        public int HotspotX;
+        public int HotspotY;
+        public IntPtr Mask;
+        public IntPtr Color;
+    }
 }

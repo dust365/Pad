@@ -6,6 +6,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.PixelFormat;
 import android.graphics.Point;
 import android.graphics.Rect;
 import android.net.nsd.NsdManager;
@@ -36,7 +37,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 在局域网里广播本机型号，接收 Mac 发来的 JPEG，并把单指左键触控送回去。
+ * 在局域网里广播本机型号，接收发送端发来的 JPEG，并把单指左键触控送回去。
  * Android 4.2 的 NsdServiceInfo 不能写 TXT，名字放在服务名和 HELLO 帧里。
  * 分辨率用屏幕真实像素，白色 U03H1 是 1024×600，黑色 K701BC 是 800×480。
  * 整帧只在画面大变时发送；平时只解码变化区域，避免 A20 软解整屏。
@@ -51,6 +52,7 @@ public class ScreenActivity extends Activity {
 
     private ScreenView screenView;
     private TextView statusView;
+    private View cover;
     private NsdManager nsdManager;
     private NsdManager.RegistrationListener registrationListener;
     private WifiManager.MulticastLock multicastLock;
@@ -64,6 +66,13 @@ public class ScreenActivity extends Activity {
     private OutputStream clientOut;
     private volatile boolean running;
     private long lastMoveAt;
+    private boolean gesture;
+    private float gestureOriginRawX;
+    private float gestureOriginRawY;
+    private int gestureOriginX;
+    private int gestureOriginY;
+    private int gestureWidth;
+    private int gestureHeight;
     private Bitmap screenBitmap;
     private Bitmap spareBitmap;
     private Canvas screenCanvas;
@@ -153,10 +162,20 @@ public class ScreenActivity extends Activity {
         root.addView(statusView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
-        setContentView(root);
+        View anchor = new View(this);
+        anchor.setBackgroundColor(0xff000000);
+        setContentView(anchor);
+        // 系统栏是 2019，普通窗口盖不住。2024 在它上面，画面按真实像素铺满，底部按键不再占高度。
+        if (!attachCover(root)) {
+            setContentView(root);
+            hideSystemUi();
+        }
         getWindow().getDecorView().setOnSystemUiVisibilityChangeListener(
                 new View.OnSystemUiVisibilityChangeListener() {
                     public void onSystemUiVisibilityChange(int visibility) {
+                        if (cover != null) {
+                            return;
+                        }
                         if ((visibility & View.SYSTEM_UI_FLAG_HIDE_NAVIGATION) == 0
                                 || (visibility & View.SYSTEM_UI_FLAG_FULLSCREEN) == 0) {
                             // 在这次回调里直接改标记会被系统丢掉，所以推迟到下一轮。
@@ -183,7 +202,9 @@ public class ScreenActivity extends Activity {
             wakeLock.acquire();
         }
         uiHandler.removeCallbacks(keepNavHidden);
-        uiHandler.post(keepNavHidden);
+        if (cover == null) {
+            uiHandler.post(keepNavHidden);
+        }
     }
 
     @Override
@@ -197,7 +218,9 @@ public class ScreenActivity extends Activity {
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
-            hideSystemUi();
+            if (cover == null) {
+                hideSystemUi();
+            }
             keepScreenAwake();
         }
     }
@@ -245,13 +268,44 @@ public class ScreenActivity extends Activity {
         settingsChanged = false;
     }
 
+    /** 盖住底部系统栏。这一层高于系统栏，点屏幕不会把它再叫出来。 */
+    private boolean attachCover(View root) {
+        WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+        if (wm == null) {
+            return false;
+        }
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                panelWidth,
+                panelHeight,
+                2024,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_FULLSCREEN
+                        | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                PixelFormat.OPAQUE);
+        lp.gravity = Gravity.LEFT | Gravity.TOP;
+        lp.x = 0;
+        lp.y = 0;
+        lp.screenBrightness = 0.55f;
+        try {
+            wm.addView(root, lp);
+            cover = root;
+            Log.i(TAG, "cover " + panelWidth + "x" + panelHeight);
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "cover window failed", e);
+            return false;
+        }
+    }
+
     private void hideSystemUi() {
         View decor = getWindow().getDecorView();
-        // 不要 LAYOUT_STABLE。它会按导航栏还在的高度排版，底部 48 像素一直空着。
-        decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+        decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                | View.SYSTEM_UI_FLAG_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                 | View.SYSTEM_UI_FLAG_LOW_PROFILE);
     }
 
@@ -278,7 +332,7 @@ public class ScreenActivity extends Activity {
     }
 
     private String waitingText() {
-        return "等待 Mac 连接\n" + padName + "\n" + panelWidth + "×" + panelHeight;
+        return "等待连接\n" + padName + "\n" + panelWidth + "×" + panelHeight;
     }
 
     private void boostCpu() {
@@ -376,7 +430,7 @@ public class ScreenActivity extends Activity {
                 clientOut = socket.getOutputStream();
             }
             Wire.writeFrame(clientOut, Wire.HELLO, Wire.hello(panelWidth, panelHeight, padName));
-            showStatus("Mac 已连接");
+            showStatus("已连接");
             InputStream in = socket.getInputStream();
             int[] type = new int[1];
             while (running) {
@@ -562,13 +616,17 @@ public class ScreenActivity extends Activity {
     }
 
     private boolean handleTouch(MotionEvent event) {
-        // 4.2 一点屏幕就会把虚拟按键叫回来，点完马上再藏。
-        uiHandler.removeCallbacks(hideUiOnce);
-        uiHandler.post(hideUiOnce);
         int action;
         int masked = event.getActionMasked();
         if (masked == MotionEvent.ACTION_DOWN) {
             action = Wire.TOUCH_DOWN;
+            gesture = true;
+            gestureWidth = screenView.getWidth();
+            gestureHeight = screenView.getHeight();
+            gestureOriginRawX = event.getRawX();
+            gestureOriginRawY = event.getRawY();
+            gestureOriginX = scaleToPanel(event.getX(), gestureWidth, panelWidth);
+            gestureOriginY = scaleToPanel(event.getY(), gestureHeight, panelHeight);
         } else if (masked == MotionEvent.ACTION_MOVE) {
             long now = System.currentTimeMillis();
             if (now - lastMoveAt < MOVE_INTERVAL_MS) {
@@ -581,13 +639,15 @@ public class ScreenActivity extends Activity {
         } else {
             return true;
         }
-        int width = screenView.getWidth();
-        int height = screenView.getHeight();
-        if (width <= 0 || height <= 0) {
+        if (!gesture || gestureWidth <= 0 || gestureHeight <= 0) {
             return true;
         }
-        int x = (int) (event.getX() * panelWidth / width);
-        int y = (int) (event.getY() * panelHeight / height);
+        // 用按下时的屏幕坐标做原点。导航栏弹出把窗口挤矮时，同一点不会变成滑动。
+        int x = gestureOriginX + Math.round((event.getRawX() - gestureOriginRawX) * panelWidth / (float) gestureWidth);
+        int y = gestureOriginY + Math.round((event.getRawY() - gestureOriginRawY) * panelHeight / (float) gestureHeight);
+        if (action == Wire.TOUCH_UP) {
+            gesture = false;
+        }
         if (x < 0) {
             x = 0;
         } else if (x >= panelWidth) {
@@ -600,6 +660,13 @@ public class ScreenActivity extends Activity {
         }
         sendTouch(action, x, y);
         return true;
+    }
+
+    private static int scaleToPanel(float viewPosition, int viewSpan, int panelSpan) {
+        if (viewSpan <= 0) {
+            return 0;
+        }
+        return (int) (viewPosition * panelSpan / viewSpan);
     }
 
     private void sendTouch(int action, int x, int y) {
@@ -675,6 +742,13 @@ public class ScreenActivity extends Activity {
                 }
             } catch (Exception ignored) {
             }
+        }
+        if (cover != null) {
+            try {
+                ((WindowManager) getSystemService(WINDOW_SERVICE)).removeView(cover);
+            } catch (Exception ignored) {
+            }
+            cover = null;
         }
         restoreAwakeSettings();
         if (wakeLock != null && wakeLock.isHeld()) {
